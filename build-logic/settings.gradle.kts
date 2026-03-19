@@ -1,15 +1,12 @@
-pluginManagement {
-    includeBuild("build-logic")
-}
-
 dependencyResolutionManagement {
     repositories {
         mavenLocal()
         gradlePluginPortal()
         mavenCentral()
     }
+    versionCatalogs {
+        create("libs") {
+            from(files("../gradle/libs.versions.toml"))
+        }
+    }
 }
-
-rootProject.name = "libprunus-java-core"
-
-include("libprunus-core-plugin")
