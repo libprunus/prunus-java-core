@@ -9,9 +9,15 @@ javaPlatform {
 
 dependencies {
     api(platform(libs.spock.bom))
+    api(platform(libs.spring.boot.bom))
 
     constraints {
         api(libs.spock.core)
+        api(libs.groovy.core) {
+            version {
+                strictly(libs.versions.groovy.get())
+            }
+        }
     }
 }
 

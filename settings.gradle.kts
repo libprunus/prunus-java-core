@@ -13,4 +13,7 @@ dependencyResolutionManagement {
 rootProject.name = "libprunus-java-core"
 
 include("libprunus-bom")
+include("libprunus-core")
 include("libprunus-core-plugin")
+include("libprunus-spring-core")
+include("libprunus-spring-server")
