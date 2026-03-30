@@ -1,5 +1,6 @@
 package org.libprunus.core.plugin.aot.log;
 
+import java.lang.reflect.Modifier;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -33,7 +34,6 @@ final class AotPojoTransformer extends AsmVisitorWrapper.AbstractBase {
     private static final String LEGACY_AOT_TOSTRING_METHOD = "_libprunus_toString";
     private static final String LEGACY_AOT_TOSTRING_DESCRIPTOR = "(I)Ljava/lang/String;";
     private static final String BUILDER_INTERNAL_NAME = "java/lang/StringBuilder";
-    private static final int DEFAULT_TOSTRING_BUILDER_CAPACITY = 256;
 
     private final TypeDescription instrumentedType;
     private final TypePoolAdapter typePoolAdapter;
@@ -99,7 +99,7 @@ final class AotPojoTransformer extends AsmVisitorWrapper.AbstractBase {
 
             @Override
             public void visitEnd() {
-                writeToStringTrampoline(cv);
+                writeToStringTrampoline(cv, fieldMetadata);
                 writeRenderMethod(cv, typeDescription, fieldMetadata);
                 super.visitEnd();
             }
@@ -178,12 +178,13 @@ final class AotPojoTransformer extends AsmVisitorWrapper.AbstractBase {
         return field.ownerInternalName() + "#" + field.name();
     }
 
-    private void writeToStringTrampoline(ClassVisitor visitor) {
+    private void writeToStringTrampoline(ClassVisitor visitor, List<AotFieldMetadata> fields) {
         MethodVisitor mv = visitor.visitMethod(Opcodes.ACC_PUBLIC, "toString", "()Ljava/lang/String;", null, null);
         mv.visitCode();
+        int computedCapacity = computeBuilderCapacity(fields.size());
         mv.visitTypeInsn(Opcodes.NEW, BUILDER_INTERNAL_NAME);
         mv.visitInsn(Opcodes.DUP);
-        mv.visitLdcInsn(DEFAULT_TOSTRING_BUILDER_CAPACITY);
+        pushInt(mv, computedCapacity);
         mv.visitMethodInsn(Opcodes.INVOKESPECIAL, BUILDER_INTERNAL_NAME, "<init>", "(I)V", false);
         mv.visitVarInsn(Opcodes.ASTORE, 1);
         mv.visitVarInsn(Opcodes.ALOAD, 0);
@@ -251,7 +252,7 @@ final class AotPojoTransformer extends AsmVisitorWrapper.AbstractBase {
         mv.visitInsn(Opcodes.POP);
     }
 
-    private static void emitRenderedFieldValue(
+    private void emitRenderedFieldValue(
             MethodVisitor mv, AotFieldMetadata field, int builderSlot, int currentDepthSlot, int maxToStringDepth) {
         if (field.masked()) {
             emitAppendString(mv, builderSlot, "***");
@@ -273,7 +274,7 @@ final class AotPojoTransformer extends AsmVisitorWrapper.AbstractBase {
         emitPrimitiveAppend(mv, field, builderSlot);
     }
 
-    private static void emitArrayAppend(
+    private void emitArrayAppend(
             MethodVisitor mv, AotFieldMetadata field, int builderSlot, int currentDepthSlot, int maxToStringDepth) {
         mv.visitVarInsn(Opcodes.ALOAD, builderSlot);
         emitFieldValue(mv, field);
@@ -288,7 +289,7 @@ final class AotPojoTransformer extends AsmVisitorWrapper.AbstractBase {
                 false);
     }
 
-    private static void emitObjectAppend(
+    private void emitObjectAppend(
             MethodVisitor mv, AotFieldMetadata field, int builderSlot, int currentDepthSlot, int maxToStringDepth) {
         mv.visitVarInsn(Opcodes.ALOAD, builderSlot);
         emitFieldValue(mv, field);
@@ -303,7 +304,7 @@ final class AotPojoTransformer extends AsmVisitorWrapper.AbstractBase {
                 false);
     }
 
-    private static void emitPrimitiveAppend(MethodVisitor mv, AotFieldMetadata field, int builderSlot) {
+    private void emitPrimitiveAppend(MethodVisitor mv, AotFieldMetadata field, int builderSlot) {
         mv.visitVarInsn(Opcodes.ALOAD, builderSlot);
         emitFieldValue(mv, field);
         mv.visitMethodInsn(
@@ -315,11 +316,24 @@ final class AotPojoTransformer extends AsmVisitorWrapper.AbstractBase {
         mv.visitInsn(Opcodes.POP);
     }
 
-    private static void emitFieldValue(MethodVisitor mv, AotFieldMetadata field) {
+    private void emitFieldValue(MethodVisitor mv, AotFieldMetadata field) {
         mv.visitVarInsn(Opcodes.ALOAD, 0);
+        if (field.renderThroughAccessor() && canReadFieldDirectly(field)) {
+            mv.visitFieldInsn(Opcodes.GETFIELD, field.ownerInternalName(), field.name(), field.descriptor());
+            return;
+        }
         if (field.renderThroughAccessor()) {
+            int invokeOpcode = accessorInvokeOpcode(field.accessorAccessFlags());
+            if (invokeOpcode == Opcodes.INVOKESTATIC) {
+                if (!field.accessorDescriptor().startsWith("()")) {
+                    throw new IllegalStateException(
+                            "AOT Log Plugin: Unsupported static accessor with parameters detected for field "
+                                    + field.name());
+                }
+                mv.visitInsn(Opcodes.POP);
+            }
             mv.visitMethodInsn(
-                    Opcodes.INVOKEVIRTUAL,
+                    invokeOpcode,
                     field.accessorOwnerInternalName(),
                     field.accessorName(),
                     field.accessorDescriptor(),
@@ -327,6 +341,26 @@ final class AotPojoTransformer extends AsmVisitorWrapper.AbstractBase {
             return;
         }
         mv.visitFieldInsn(Opcodes.GETFIELD, field.ownerInternalName(), field.name(), field.descriptor());
+    }
+
+    private boolean canReadFieldDirectly(AotFieldMetadata field) {
+        if (field.ownerInternalName().equals(instrumentedType.getInternalName())) {
+            return true;
+        }
+        if (field.isPublic() || field.isProtected()) {
+            return true;
+        }
+        return field.isPackagePrivate() && samePackage(instrumentedPackage, packageName(field.ownerInternalName()));
+    }
+
+    private static int accessorInvokeOpcode(int accessorAccessFlags) {
+        if (Modifier.isStatic(accessorAccessFlags)) {
+            return Opcodes.INVOKESTATIC;
+        }
+        if (Modifier.isPrivate(accessorAccessFlags)) {
+            return Opcodes.INVOKESPECIAL;
+        }
+        return Opcodes.INVOKEVIRTUAL;
     }
 
     private static String appendDescriptor(String descriptor) {
@@ -416,8 +450,32 @@ final class AotPojoTransformer extends AsmVisitorWrapper.AbstractBase {
         return leftPackage.equals(rightPackage);
     }
 
+    private static int computeBuilderCapacity(int fieldCount) {
+        return Math.max(16, fieldCount * 32);
+    }
+
+    private static void pushInt(MethodVisitor mv, int value) {
+        if (value >= -1 && value <= 5) {
+            mv.visitInsn(value == -1 ? Opcodes.ICONST_M1 : Opcodes.ICONST_0 + value);
+            return;
+        }
+        if (value >= Byte.MIN_VALUE && value <= Byte.MAX_VALUE) {
+            mv.visitIntInsn(Opcodes.BIPUSH, value);
+            return;
+        }
+        if (value >= Short.MIN_VALUE && value <= Short.MAX_VALUE) {
+            mv.visitIntInsn(Opcodes.SIPUSH, value);
+            return;
+        }
+        mv.visitLdcInsn(value);
+    }
+
     private boolean canUseAccessor(AotFieldMetadata field, String ownerInternalName) {
         if (!field.hasAccessor()) {
+            return false;
+        }
+        boolean declaredInCurrentClass = field.ownerInternalName().equals(instrumentedType.getInternalName());
+        if (!declaredInCurrentClass && field.accessorIsPrivate()) {
             return false;
         }
         if (field.accessorIsPublic() || field.accessorIsProtected()) {

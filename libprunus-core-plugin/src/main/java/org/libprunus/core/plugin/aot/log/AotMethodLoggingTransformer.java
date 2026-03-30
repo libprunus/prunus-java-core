@@ -25,6 +25,7 @@ import net.bytebuddy.jar.asm.Opcodes;
 import net.bytebuddy.jar.asm.Type;
 import net.bytebuddy.pool.TypePool;
 import net.bytebuddy.utility.visitor.LocalVariableAwareMethodVisitor;
+import org.libprunus.core.log.annotation.AotNoReplace;
 import org.libprunus.core.log.annotation.LogIgnore;
 import org.libprunus.core.log.annotation.MaskStrategy;
 import org.libprunus.core.log.annotation.Sensitive;
@@ -42,24 +43,14 @@ final class AotMethodLoggingTransformer extends AsmVisitorWrapper.AbstractBase {
             "condyLoggerFactory",
             "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/Class;)Lorg/slf4j/Logger;",
             false);
-
     private final String classNameFormat;
-    private final String enterLogLevel;
-    private final String exitLogLevel;
-    private final String exceptionLogLevel;
-    private final boolean printExceptionStackTrace;
+    private final AotLogLevel enterLogLevel;
+    private final AotLogLevel exitLogLevel;
 
-    AotMethodLoggingTransformer(
-            String classNameFormat,
-            boolean printExceptionStackTrace,
-            String enterLogLevel,
-            String exitLogLevel,
-            String exceptionLogLevel) {
+    AotMethodLoggingTransformer(String classNameFormat, AotLogLevel enterLogLevel, AotLogLevel exitLogLevel) {
         this.classNameFormat = classNameFormat;
-        this.printExceptionStackTrace = printExceptionStackTrace;
         this.enterLogLevel = enterLogLevel;
         this.exitLogLevel = exitLogLevel;
-        this.exceptionLogLevel = exceptionLogLevel;
     }
 
     @Override
@@ -92,6 +83,7 @@ final class AotMethodLoggingTransformer extends AsmVisitorWrapper.AbstractBase {
                 MethodDescription method = methods.filter(named(name).and(hasDescriptor(descriptor)))
                         .getOnly();
                 if (method.isBridge()
+                        || method.getDeclaredAnnotations().isAnnotationPresent(AotNoReplace.class)
                         || method.getDeclaredAnnotations().isAnnotationPresent(LogIgnore.class)
                         || ("toString".equals(name) && "()Ljava/lang/String;".equals(descriptor))) {
                     return delegate;
@@ -108,11 +100,6 @@ final class AotMethodLoggingTransformer extends AsmVisitorWrapper.AbstractBase {
         private final String renderedMethodName;
         private final Type returnType;
         private final boolean sensitiveReturn;
-        private final Label methodStart = new Label();
-        private final Label methodEnd = new Label();
-        private final Label normalExit = new Label();
-        private final Label exceptionExit = new Label();
-        private boolean hasNormalReturn;
 
         private LoggingMethodVisitor(
                 MethodVisitor methodVisitor, TypeDescription declaringType, MethodDescription method) {
@@ -130,15 +117,24 @@ final class AotMethodLoggingTransformer extends AsmVisitorWrapper.AbstractBase {
         @Override
         public void visitCode() {
             super.visitCode();
-            mv.visitLabel(methodStart);
             emitEnterLogging();
         }
 
         @Override
         public void visitInsn(int opcode) {
-            if (opcode >= Opcodes.IRETURN && opcode <= Opcodes.RETURN) {
-                hasNormalReturn = true;
-                mv.visitJumpInsn(Opcodes.GOTO, normalExit);
+            // TODO: Evaluate whether a shared exit node is worth the verifier and local-slot complexity across this
+            // method shape range, versus keeping duplicated inline exit logging and simpler control flow.
+            if (opcode == Opcodes.RETURN) {
+                emitVoidExitLogging();
+                super.visitInsn(opcode);
+                return;
+            }
+            if (opcode >= Opcodes.IRETURN && opcode <= Opcodes.ARETURN) {
+                int returnValueSlot = getFreeOffset();
+                mv.visitVarInsn(returnType.getOpcode(Opcodes.ISTORE), returnValueSlot);
+                emitInlineNormalExitLogging(returnType, returnValueSlot);
+                mv.visitVarInsn(returnType.getOpcode(Opcodes.ILOAD), returnValueSlot);
+                super.visitInsn(opcode);
                 return;
             }
             super.visitInsn(opcode);
@@ -146,32 +142,30 @@ final class AotMethodLoggingTransformer extends AsmVisitorWrapper.AbstractBase {
 
         @Override
         public void visitMaxs(int maxStack, int maxLocals) {
-            mv.visitLabel(methodEnd);
-            mv.visitTryCatchBlock(methodStart, methodEnd, exceptionExit, "java/lang/Throwable");
-            int returnValueSlot = maxLocals;
-            int throwableSlot = returnValueSlot + Math.max(returnType.getSize(), 1);
-
-            if (hasNormalReturn) {
-                mv.visitLabel(normalExit);
-                emitNormalExitLogging(returnValueSlot);
-            }
-
-            mv.visitLabel(exceptionExit);
-            emitExceptionExitLogging(throwableSlot);
-
-            super.visitMaxs(maxStack, throwableSlot + 1);
+            super.visitMaxs(maxStack, maxLocals);
         }
 
         private void emitEnterLogging() {
-            Label skipLog = new Label();
-            emitLevelGuard(enterLogLevel, skipLog);
+            Label done = new Label();
+            Label logStart = new Label();
+            Label logEnd = new Label();
+            Label logFailure = new Label();
+
+            mv.visitLabel(logStart);
+            emitLevelGuard(enterLogLevel, done);
 
             emitLoggerConstant();
             List<EnterParameter> parameters = collectEnterParameters();
             String message = enterMessageTemplate(parameters);
             List<EnterParameter> loggedValues = visibleEnterParameters(parameters);
             emitParameterizedLogCall(enterLogLevel, message, loggedValues);
-            mv.visitLabel(skipLog);
+            mv.visitLabel(logEnd);
+            mv.visitJumpInsn(Opcodes.GOTO, done);
+
+            mv.visitLabel(logFailure);
+            emitLogFailurePolicy();
+            mv.visitLabel(done);
+            mv.visitTryCatchBlock(logStart, logEnd, logFailure, "java/lang/Throwable");
         }
 
         private List<EnterParameter> collectEnterParameters() {
@@ -225,17 +219,14 @@ final class AotMethodLoggingTransformer extends AsmVisitorWrapper.AbstractBase {
             return builder.append(')').toString();
         }
 
-        private void emitNormalExitLogging(int returnValueSlot) {
-            if (returnType.getSort() == Type.VOID) {
-                emitVoidExitLogging();
-                mv.visitInsn(Opcodes.RETURN);
-                return;
-            }
+        private void emitInlineNormalExitLogging(Type valueType, int returnValueSlot) {
+            Label done = new Label();
+            Label logStart = new Label();
+            Label logEnd = new Label();
+            Label logFailure = new Label();
 
-            mv.visitVarInsn(returnType.getOpcode(Opcodes.ISTORE), returnValueSlot);
-
-            Label skipLog = new Label();
-            emitLevelGuard(exitLogLevel, skipLog);
+            mv.visitLabel(logStart);
+            emitLevelGuard(exitLogLevel, done);
             emitLoggerConstant();
 
             if (sensitiveReturn) {
@@ -243,112 +234,112 @@ final class AotMethodLoggingTransformer extends AsmVisitorWrapper.AbstractBase {
                 invokeLogger(exitLogLevel, "(Ljava/lang/String;)V");
             } else {
                 mv.visitLdcInsn("|< [EXIT] " + renderedClassName + "." + renderedMethodName + "(value={})");
-                emitValueFromLocalForLogging(returnType, returnValueSlot);
+                emitValueFromLocalForLogging(valueType, returnValueSlot);
                 invokeLogger(exitLogLevel, "(Ljava/lang/String;Ljava/lang/Object;)V");
             }
+            mv.visitLabel(logEnd);
+            mv.visitJumpInsn(Opcodes.GOTO, done);
 
-            mv.visitLabel(skipLog);
-            mv.visitVarInsn(returnType.getOpcode(Opcodes.ILOAD), returnValueSlot);
-            mv.visitInsn(returnType.getOpcode(Opcodes.IRETURN));
-        }
-
-        private void emitExceptionExitLogging(int throwableSlot) {
-            mv.visitVarInsn(Opcodes.ASTORE, throwableSlot);
-            mv.visitVarInsn(Opcodes.ALOAD, throwableSlot);
-            emitLoggerConstant();
-            mv.visitLdcInsn(exceptionLogLevel);
-            mv.visitLdcInsn("|< [EXIT - EXCEPTION] " + renderedClassName + "." + renderedMethodName);
-            mv.visitInsn(printExceptionStackTrace ? Opcodes.ICONST_1 : Opcodes.ICONST_0);
-            mv.visitMethodInsn(
-                    Opcodes.INVOKESTATIC,
-                    "org/libprunus/core/log/runtime/AotLogRuntime",
-                    "logException",
-                    "(Ljava/lang/Throwable;Lorg/slf4j/Logger;Ljava/lang/String;Ljava/lang/String;Z)V",
-                    false);
-            mv.visitVarInsn(Opcodes.ALOAD, throwableSlot);
-            mv.visitInsn(Opcodes.ATHROW);
+            mv.visitLabel(logFailure);
+            emitLogFailurePolicy();
+            mv.visitLabel(done);
+            mv.visitTryCatchBlock(logStart, logEnd, logFailure, "java/lang/Throwable");
         }
 
         private void emitVoidExitLogging() {
-            Label skipLog = new Label();
-            emitLevelGuard(exitLogLevel, skipLog);
+            Label done = new Label();
+            Label logStart = new Label();
+            Label logEnd = new Label();
+            Label logFailure = new Label();
+
+            mv.visitLabel(logStart);
+            emitLevelGuard(exitLogLevel, done);
 
             emitLoggerConstant();
             mv.visitLdcInsn("|< [EXIT] " + renderedClassName + "." + renderedMethodName + "()");
             invokeLogger(exitLogLevel, "(Ljava/lang/String;)V");
-            mv.visitLabel(skipLog);
+            mv.visitLabel(logEnd);
+            mv.visitJumpInsn(Opcodes.GOTO, done);
+
+            mv.visitLabel(logFailure);
+            emitLogFailurePolicy();
+            mv.visitLabel(done);
+            mv.visitTryCatchBlock(logStart, logEnd, logFailure, "java/lang/Throwable");
         }
 
-        private void emitParameterizedLogCall(String level, String message, List<EnterParameter> values) {
+        private void emitLogFailurePolicy() {
+            Label nonError = new Label();
+            mv.visitInsn(Opcodes.DUP);
+            mv.visitTypeInsn(Opcodes.INSTANCEOF, "java/lang/Error");
+            mv.visitJumpInsn(Opcodes.IFEQ, nonError);
+            mv.visitTypeInsn(Opcodes.CHECKCAST, "java/lang/Error");
+            mv.visitInsn(Opcodes.ATHROW);
+            mv.visitLabel(nonError);
+            // TODO: Define the non-Error failure policy for logging side effects in a way that preserves
+            // business-path resilience while still making loss of logging observability measurable.
+            mv.visitInsn(Opcodes.POP);
+        }
+
+        private void emitParameterizedLogCall(AotLogLevel level, String message, List<EnterParameter> values) {
             int valueCount = values.size();
-            mv.visitLdcInsn(message);
             if (valueCount == 0) {
+                mv.visitLdcInsn(message);
                 invokeLogger(level, "(Ljava/lang/String;)V");
                 return;
             }
             if (valueCount == 1) {
+                mv.visitLdcInsn(message);
                 emitValueFromLocalForLogging(values.get(0).type(), values.get(0).localSlot());
                 invokeLogger(level, "(Ljava/lang/String;Ljava/lang/Object;)V");
                 return;
             }
             if (valueCount == 2) {
+                mv.visitLdcInsn(message);
                 emitValueFromLocalForLogging(values.get(0).type(), values.get(0).localSlot());
                 emitValueFromLocalForLogging(values.get(1).type(), values.get(1).localSlot());
                 invokeLogger(level, "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V");
                 return;
             }
 
-            pushInt(valueCount);
-            mv.visitTypeInsn(Opcodes.ANEWARRAY, "java/lang/Object");
-            for (int index = 0; index < valueCount; index++) {
-                EnterParameter parameter = values.get(index);
-                mv.visitInsn(Opcodes.DUP);
-                pushInt(index);
+            mv.visitMethodInsn(
+                    Opcodes.INVOKEINTERFACE,
+                    "org/slf4j/Logger",
+                    fluentAtLevelMethod(level),
+                    "()Lorg/slf4j/spi/LoggingEventBuilder;",
+                    true);
+
+            for (EnterParameter parameter : values) {
                 emitValueFromLocalForLogging(parameter.type(), parameter.localSlot());
-                mv.visitInsn(Opcodes.AASTORE);
+                mv.visitMethodInsn(
+                        Opcodes.INVOKEINTERFACE,
+                        "org/slf4j/spi/LoggingEventBuilder",
+                        "addArgument",
+                        "(Ljava/lang/Object;)Lorg/slf4j/spi/LoggingEventBuilder;",
+                        true);
             }
-            invokeLogger(level, "(Ljava/lang/String;[Ljava/lang/Object;)V");
+
+            mv.visitLdcInsn(message);
+            mv.visitMethodInsn(
+                    Opcodes.INVOKEINTERFACE, "org/slf4j/spi/LoggingEventBuilder", "log", "(Ljava/lang/String;)V", true);
         }
 
         private void emitValueFromLocalForLogging(Type valueType, int localSlot) {
             mv.visitVarInsn(valueType.getOpcode(Opcodes.ILOAD), localSlot);
-            if (valueType.getSort() == Type.ARRAY) {
-                emitTypedArrayToString(valueType);
+            if (valueType.getSort() < Type.ARRAY) {
+                boxPrimitiveIfNeeded(valueType);
                 return;
             }
-            boxPrimitiveIfNeeded(valueType);
-        }
-
-        private void emitTypedArrayToString(Type valueType) {
-            String descriptor = valueType.getDescriptor();
-            if (isPrimitiveArrayDescriptor(descriptor)) {
-                mv.visitInsn(Opcodes.ICONST_0);
-                mv.visitLdcInsn(MAX_ARRAY_LOG_ELEMENTS);
-                mv.visitLdcInsn(MAX_ARRAY_LOG_DEPTH);
-                mv.visitMethodInsn(
-                        Opcodes.INVOKESTATIC,
-                        "org/libprunus/core/log/runtime/AotLogRuntime",
-                        "safeArrayToString",
-                        "(" + descriptor + "III)Ljava/lang/String;",
-                        false);
-                return;
-            }
-            mv.visitTypeInsn(Opcodes.CHECKCAST, "[Ljava/lang/Object;");
+            // TODO: Evaluate eager safe stringification against deferred rendering adapters, balancing deterministic
+            // safety guarantees with allocation cost and logger-backend execution paths after level checks.
             mv.visitInsn(Opcodes.ICONST_0);
             mv.visitLdcInsn(MAX_ARRAY_LOG_ELEMENTS);
             mv.visitLdcInsn(MAX_ARRAY_LOG_DEPTH);
             mv.visitMethodInsn(
                     Opcodes.INVOKESTATIC,
                     "org/libprunus/core/log/runtime/AotLogRuntime",
-                    "safeArrayToString",
-                    "([Ljava/lang/Object;III)Ljava/lang/String;",
+                    "safeObjectToString",
+                    "(Ljava/lang/Object;III)Ljava/lang/String;",
                     false);
-        }
-
-        private boolean isPrimitiveArrayDescriptor(String descriptor) {
-            return descriptor.length() == 2
-                    && descriptor.charAt(0) == '['
-                    && "ZBCSIJFD".indexOf(descriptor.charAt(1)) >= 0;
         }
 
         private void boxPrimitiveIfNeeded(Type type) {
@@ -379,18 +370,6 @@ final class AotMethodLoggingTransformer extends AsmVisitorWrapper.AbstractBase {
             }
         }
 
-        private void pushInt(int value) {
-            if (value >= -1 && value <= 5) {
-                mv.visitInsn(value == -1 ? Opcodes.ICONST_M1 : Opcodes.ICONST_0 + value);
-                return;
-            }
-            if (value <= Byte.MAX_VALUE) {
-                mv.visitIntInsn(Opcodes.BIPUSH, value);
-                return;
-            }
-            mv.visitIntInsn(Opcodes.SIPUSH, value);
-        }
-
         private void emitLoggerConstant() {
             mv.visitLdcInsn(new ConstantDynamic("LIBPRUNUS_AOT_LOGGER", LOGGER_DESCRIPTOR, LOGGER_CONDY_BOOTSTRAP));
         }
@@ -399,7 +378,7 @@ final class AotMethodLoggingTransformer extends AsmVisitorWrapper.AbstractBase {
             return method.isStatic() ? 0 : 1;
         }
 
-        private void emitLevelGuard(String level, Label skipLog) {
+        private void emitLevelGuard(AotLogLevel level, Label skipLog) {
             mv.visitMethodInsn(
                     Opcodes.INVOKESTATIC, "org/libprunus/core/log/runtime/AotLogRuntime", "isEnabled", "()Z", false);
             mv.visitJumpInsn(Opcodes.IFEQ, skipLog);
@@ -408,19 +387,38 @@ final class AotMethodLoggingTransformer extends AsmVisitorWrapper.AbstractBase {
             mv.visitJumpInsn(Opcodes.IFEQ, skipLog);
         }
 
-        private String enabledMethodName(String level) {
+        private String enabledMethodName(AotLogLevel level) {
             return switch (level) {
-                case "TRACE" -> "isTraceEnabled";
-                case "DEBUG" -> "isDebugEnabled";
-                case "INFO" -> "isInfoEnabled";
-                case "WARN" -> "isWarnEnabled";
-                case "ERROR" -> "isErrorEnabled";
-                default -> throw new IllegalArgumentException("Unsupported level: " + level);
+                case TRACE -> "isTraceEnabled";
+                case DEBUG -> "isDebugEnabled";
+                case INFO -> "isInfoEnabled";
+                case WARN -> "isWarnEnabled";
+                case ERROR -> "isErrorEnabled";
             };
         }
 
-        private void invokeLogger(String level, String descriptor) {
-            mv.visitMethodInsn(Opcodes.INVOKEINTERFACE, "org/slf4j/Logger", level.toLowerCase(), descriptor, true);
+        private void invokeLogger(AotLogLevel level, String descriptor) {
+            mv.visitMethodInsn(Opcodes.INVOKEINTERFACE, "org/slf4j/Logger", loggerMethodName(level), descriptor, true);
+        }
+
+        private String loggerMethodName(AotLogLevel level) {
+            return switch (level) {
+                case TRACE -> "trace";
+                case DEBUG -> "debug";
+                case INFO -> "info";
+                case WARN -> "warn";
+                case ERROR -> "error";
+            };
+        }
+
+        private String fluentAtLevelMethod(AotLogLevel level) {
+            return switch (level) {
+                case TRACE -> "atTrace";
+                case DEBUG -> "atDebug";
+                case INFO -> "atInfo";
+                case WARN -> "atWarn";
+                case ERROR -> "atError";
+            };
         }
 
         private record EnterParameter(String name, Type type, int localSlot, boolean sensitive, int slotSize) {}

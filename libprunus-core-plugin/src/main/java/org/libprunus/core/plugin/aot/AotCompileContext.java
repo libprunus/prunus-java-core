@@ -146,15 +146,14 @@ public final class AotCompileContext {
             return null;
         }
 
-        CompletableFuture<AotClassMetadata> cached = metadataCache.get(className);
-        if (cached != null) {
-            return unwrapJoin(cached);
-        }
-
-        CompletableFuture<AotClassMetadata> future = new CompletableFuture<>();
-        CompletableFuture<AotClassMetadata> existing = metadataCache.putIfAbsent(className, future);
+        CompletableFuture<AotClassMetadata> existing = metadataCache.get(className);
         if (existing != null) {
             return unwrapJoin(existing);
+        }
+        CompletableFuture<AotClassMetadata> newFuture = new CompletableFuture<>();
+        CompletableFuture<AotClassMetadata> winner = metadataCache.putIfAbsent(className, newFuture);
+        if (winner != null) {
+            return unwrapJoin(winner);
         }
 
         try {
@@ -163,15 +162,20 @@ public final class AotCompileContext {
             if (type.getSuperClass() != null) {
                 String parentName = type.getSuperClass().asErasure().getName();
                 if (!Object.class.getName().equals(parentName)) {
+                    // TODO Define whether superclass metadata traversal should share the same boundary as root-type
+                    // eligibility. The current package gate prevents unbounded metadata expansion into dependency
+                    // hierarchies, but it also drops inherited audit fields when parent types sit outside configured
+                    // base packages. A dedicated superclass-metadata policy may preserve field visibility without
+                    // broadening instrumentation scope.
                     parentMeta = resolveMetadata(parentName, typeProvider);
                 }
             }
             AotClassMetadata metadata = buildMetadata(type, parentMeta);
-            future.complete(metadata);
+            newFuture.complete(metadata);
             return metadata;
         } catch (Throwable throwable) {
-            future.completeExceptionally(throwable);
-            metadataCache.remove(className, future);
+            newFuture.completeExceptionally(throwable);
+            metadataCache.remove(className, newFuture);
             throw throwable;
         }
     }
@@ -234,7 +238,7 @@ public final class AotCompileContext {
         Map<String, List<AccessorMethod>> methodsByName = indexAccessorMethods(type);
 
         for (InDefinedShape field : type.getDeclaredFields()) {
-            if (field.isSynthetic() || field.isStatic()) {
+            if (field.isSynthetic() || field.isStatic() || Modifier.isTransient(field.getModifiers())) {
                 continue;
             }
 
@@ -298,83 +302,45 @@ public final class AotCompileContext {
 
     private net.bytebuddy.description.method.MethodDescription.InDefinedShape resolveAccessor(
             Map<String, List<AccessorMethod>> methodsByName, InDefinedShape field) {
+        String fieldName = field.getName();
         if (field.getDeclaringType().asErasure().isRecord()) {
-            List<AccessorMethod> recordAccessors = methodsByName.getOrDefault(field.getName(), List.of());
+            List<AccessorMethod> recordAccessors = methodsByName.getOrDefault(fieldName, List.of());
             for (AccessorMethod candidate : recordAccessors) {
                 if (candidate.returnDescriptor().equals(field.getDescriptor())) {
                     return candidate.method();
                 }
             }
         }
-        String fieldName = field.getName();
+        if (fieldName.isEmpty()) {
+            return null;
+        }
         boolean booleanField = isBooleanField(field.getDescriptor());
-        List<AccessorMethod> getterMethods = findAccessorCandidates(methodsByName, "get", fieldName);
-        List<AccessorMethod> isMethods =
-                booleanField ? findAccessorCandidates(methodsByName, "is", fieldName) : List.of();
+
+        if (booleanField) {
+            String isName = BeanPropertyNamingHelper.toGetterName(fieldName, true);
+            List<AccessorMethod> isMethods = methodsByName.getOrDefault(isName, List.of());
+            for (AccessorMethod candidate : isMethods) {
+                if (isBooleanField(candidate.returnDescriptor())) {
+                    return candidate.method();
+                }
+            }
+        }
+
+        String getterName = BeanPropertyNamingHelper.toGetterName(fieldName, false);
+        List<AccessorMethod> getterMethods = methodsByName.getOrDefault(getterName, List.of());
         net.bytebuddy.description.method.MethodDescription.InDefinedShape exactMatch = null;
-        int getterIndex = 0;
-        int isIndex = 0;
-
-        while (getterIndex < getterMethods.size() || isIndex < isMethods.size()) {
-            boolean pickGetter = isIndex >= isMethods.size()
-                    || (getterIndex < getterMethods.size()
-                            && getterMethods.get(getterIndex).order()
-                                    <= isMethods.get(isIndex).order());
-
-            AccessorMethod candidate = pickGetter ? getterMethods.get(getterIndex++) : isMethods.get(isIndex++);
+        for (AccessorMethod candidate : getterMethods) {
             net.bytebuddy.description.method.MethodDescription.InDefinedShape method = candidate.method();
             String returnDescriptor = candidate.returnDescriptor();
 
-            if (pickGetter) {
-                if (returnDescriptor.equals(field.getDescriptor())) {
-                    return method;
-                }
-                if (exactMatch == null && !"V".equals(returnDescriptor)) {
-                    exactMatch = method;
-                }
-                continue;
-            }
-
-            if (isBooleanField(returnDescriptor)) {
+            if (returnDescriptor.equals(field.getDescriptor())) {
                 return method;
+            }
+            if (exactMatch == null && !"V".equals(returnDescriptor)) {
+                exactMatch = method;
             }
         }
         return exactMatch;
-    }
-
-    private static List<AccessorMethod> findAccessorCandidates(
-            Map<String, List<AccessorMethod>> methodsByName, String prefix, String fieldName) {
-        if (fieldName.isEmpty()) {
-            return List.of();
-        }
-        for (Map.Entry<String, List<AccessorMethod>> entry : methodsByName.entrySet()) {
-            if (matchesAccessorName(entry.getKey(), prefix, fieldName)) {
-                return entry.getValue();
-            }
-        }
-        return List.of();
-    }
-
-    private static boolean matchesAccessorName(String methodName, String prefix, String fieldName) {
-        int prefixLen = prefix.length();
-        if (methodName.length() != prefixLen + fieldName.length()) {
-            return false;
-        }
-        for (int i = 0; i < prefixLen; i++) {
-            if (methodName.charAt(i) != prefix.charAt(i)) {
-                return false;
-            }
-        }
-        char firstChar = fieldName.charAt(0);
-        if (methodName.charAt(prefixLen) != Character.toUpperCase(firstChar)) {
-            return false;
-        }
-        for (int i = 1; i < fieldName.length(); i++) {
-            if (methodName.charAt(prefixLen + i) != fieldName.charAt(i)) {
-                return false;
-            }
-        }
-        return true;
     }
 
     private record AccessorMethod(int order, net.bytebuddy.description.method.MethodDescription.InDefinedShape method) {

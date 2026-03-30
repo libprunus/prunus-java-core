@@ -4,6 +4,7 @@ import java.lang.invoke.MethodHandles;
 import java.util.Collection;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicReference;
 import org.libprunus.core.config.CoreRuntimeConfig;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -13,7 +14,9 @@ public final class AotLogRuntime {
     private static final String AOT_LOGGER_FIELD = "LIBPRUNUS_AOT_LOGGER";
     private static final int DEFAULT_MAX_RENDER_ELEMENTS = 100;
     private static final int DEFAULT_BUILDER_CAPACITY = 256;
-    private static volatile boolean LOG_ENABLED = true;
+    private static final CoreRuntimeConfig DEFAULT_CONFIG = new CoreRuntimeConfig(new LogRuntimeConfig(true));
+    private static volatile AtomicReference<CoreRuntimeConfig> ACTIVE_CONFIG_REF =
+            new AtomicReference<>(DEFAULT_CONFIG);
 
     private AotLogRuntime() {
         throw new UnsupportedOperationException();
@@ -21,17 +24,21 @@ public final class AotLogRuntime {
 
     public static void initialize(CoreRuntimeConfig initialConfig) {
         CoreRuntimeConfig config = Objects.requireNonNull(initialConfig, "initialConfig must not be null");
-        updateConfig(config.log());
+        ACTIVE_CONFIG_REF.set(config);
+    }
+
+    public static void linkToDataPlane(AtomicReference<CoreRuntimeConfig> configRef) {
+        ACTIVE_CONFIG_REF = Objects.requireNonNull(configRef, "configRef must not be null");
     }
 
     public static void updateConfig(LogRuntimeConfig newConfig) {
         if (newConfig != null) {
-            LOG_ENABLED = newConfig.enabled();
+            ACTIVE_CONFIG_REF.set(new CoreRuntimeConfig(newConfig));
         }
     }
 
     public static boolean isEnabled() {
-        return LOG_ENABLED;
+        return ACTIVE_CONFIG_REF.get().log().enabled();
     }
 
     public static Logger condyLoggerFactory(MethodHandles.Lookup lookup, String name, Class<?> type) {
@@ -43,97 +50,11 @@ public final class AotLogRuntime {
         return LoggerFactory.getLogger(owner);
     }
 
-    public static boolean isLevelEnabled(Logger logger, String level) {
-        if (!LOG_ENABLED) {
+    public static boolean isLevelEnabled(Logger logger, LogLevel level) {
+        if (!ACTIVE_CONFIG_REF.get().log().enabled()) {
             return false;
         }
-        return switch (level) {
-            case "TRACE" -> logger.isTraceEnabled();
-            case "DEBUG" -> logger.isDebugEnabled();
-            case "INFO" -> logger.isInfoEnabled();
-            case "WARN" -> logger.isWarnEnabled();
-            case "ERROR" -> logger.isErrorEnabled();
-            default -> throw new IllegalArgumentException("Unsupported level: " + level);
-        };
-    }
-
-    public static void logException(
-            Throwable throwable, Logger logger, String level, String prefix, boolean printStackTrace) {
-        if (!isLevelEnabled(logger, level)) {
-            return;
-        }
-        if (throwable == null) {
-            dispatchLog(logger, level, prefix + "(exception=null)", null);
-            return;
-        }
-
-        StringBuilder message = new StringBuilder(prefix).append("(exception=").append(throwable);
-        if (printStackTrace) {
-            message.append(", stacktrace=attached");
-        }
-        Throwable[] suppressed = throwable.getSuppressed();
-        if (suppressed.length > 0) {
-            int limit = Math.min(suppressed.length, DEFAULT_MAX_RENDER_ELEMENTS);
-            message.append(", suppressed=[");
-            message.append(suppressed[0]);
-            for (int index = 1; index < limit; index++) {
-                message.append(", ");
-                message.append(suppressed[index]);
-            }
-            appendTruncation(message, suppressed.length, limit);
-            message.append(']');
-        }
-        message.append(')');
-
-        try {
-            dispatchLog(logger, level, message.toString(), printStackTrace ? throwable : null);
-        } catch (Exception logFailure) {
-            throwable.addSuppressed(logFailure);
-        } catch (Error logError) {
-            logError.addSuppressed(throwable);
-            throw logError;
-        }
-    }
-
-    private static void dispatchLog(Logger logger, String level, String message, Throwable throwable) {
-        switch (level) {
-            case "TRACE" -> {
-                if (throwable != null) {
-                    logger.trace(message, throwable);
-                } else {
-                    logger.trace(message);
-                }
-            }
-            case "DEBUG" -> {
-                if (throwable != null) {
-                    logger.debug(message, throwable);
-                } else {
-                    logger.debug(message);
-                }
-            }
-            case "INFO" -> {
-                if (throwable != null) {
-                    logger.info(message, throwable);
-                } else {
-                    logger.info(message);
-                }
-            }
-            case "WARN" -> {
-                if (throwable != null) {
-                    logger.warn(message, throwable);
-                } else {
-                    logger.warn(message);
-                }
-            }
-            case "ERROR" -> {
-                if (throwable != null) {
-                    logger.error(message, throwable);
-                } else {
-                    logger.error(message);
-                }
-            }
-            default -> throw new IllegalArgumentException("Unsupported level: " + level);
-        }
+        return level.isEnabled(logger);
     }
 
     public static String safeObjectToString(Object value, int currentDepth, int maxDepth) {
@@ -453,7 +374,41 @@ public final class AotLogRuntime {
             appendMapTo(builder, map, currentDepth, maxElements, maxDepth);
             return;
         }
-        builder.append(String.valueOf(value));
+        if (ToStringWhitelistClassifier.isToStringWhitelisted(value.getClass())) {
+            appendSafeScalarTo(builder, value);
+            return;
+        }
+        appendIdentityTo(builder, value);
+    }
+
+    private static void appendSafeScalarTo(StringBuilder builder, Object value) {
+        if (value instanceof CharSequence sequence) {
+            builder.append(sequence);
+            return;
+        }
+        if (value instanceof Boolean bool) {
+            builder.append(bool.booleanValue());
+            return;
+        }
+        if (value instanceof Character character) {
+            builder.append(character.charValue());
+            return;
+        }
+        if (value instanceof Enum<?> enumValue) {
+            builder.append(enumValue.name());
+            return;
+        }
+        if (value instanceof Class<?> type) {
+            builder.append("class ").append(type.getName());
+            return;
+        }
+        builder.append(value.toString());
+    }
+
+    private static void appendIdentityTo(StringBuilder builder, Object value) {
+        builder.append(value.getClass().getName())
+                .append('@')
+                .append(Integer.toHexString(System.identityHashCode(value)));
     }
 
     private static void appendPrimitiveTo(StringBuilder builder, boolean[] value, int maxElements) {

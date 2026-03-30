@@ -5,6 +5,7 @@ import net.bytebuddy.description.type.TypeDescription;
 import net.bytebuddy.dynamic.ClassFileLocator;
 import net.bytebuddy.dynamic.DynamicType;
 import net.bytebuddy.pool.TypePool;
+import org.libprunus.core.log.annotation.AotNoReplace;
 import org.libprunus.core.log.annotation.Sensitive;
 import org.libprunus.core.plugin.aot.AotCompileContext;
 import org.libprunus.core.plugin.aot.AotPluginArguments;
@@ -18,10 +19,8 @@ public final class AotLogByteBuddyPlugin implements Plugin {
     private final String[] targetClassSuffixes;
     private final String[] pojoSuffixes;
     private final String classNameFormat;
-    private final boolean printExceptionStackTrace;
-    private final String enterLogLevel;
-    private final String exitLogLevel;
-    private final String exceptionLogLevel;
+    private final AotLogLevel enterLogLevel;
+    private final AotLogLevel exitLogLevel;
     private final boolean handleInaccessibleField;
     private final int maxToStringDepth;
     private final AotCompileContext compileContext;
@@ -37,10 +36,8 @@ public final class AotLogByteBuddyPlugin implements Plugin {
         this.targetClassSuffixes = arguments.log().targetClassSuffixes().toArray(new String[0]);
         this.pojoSuffixes = arguments.log().pojoSuffixes().toArray(new String[0]);
         this.classNameFormat = arguments.log().classNameFormat();
-        this.printExceptionStackTrace = arguments.log().printExceptionStackTrace();
-        this.enterLogLevel = arguments.log().enterLogLevel();
-        this.exitLogLevel = arguments.log().exitLogLevel();
-        this.exceptionLogLevel = arguments.log().exceptionLogLevel();
+        this.enterLogLevel = AotLogLevel.valueOf(arguments.log().enterLogLevel());
+        this.exitLogLevel = AotLogLevel.valueOf(arguments.log().exitLogLevel());
         this.handleInaccessibleField = arguments.log().handleInaccessibleField();
         this.maxToStringDepth = arguments.log().maxToStringDepth();
         this.compileContext = compileContext;
@@ -49,6 +46,9 @@ public final class AotLogByteBuddyPlugin implements Plugin {
     @Override
     public boolean matches(TypeDescription target) {
         if (!enabled || target.isInterface() || target.isEnum() || target.isAnnotation()) {
+            return false;
+        }
+        if (target.getDeclaredAnnotations().isAnnotationPresent(AotNoReplace.class)) {
             return false;
         }
         String className = target.getName();
@@ -63,8 +63,8 @@ public final class AotLogByteBuddyPlugin implements Plugin {
             DynamicType.Builder<?> builder, TypeDescription typeDescription, ClassFileLocator classFileLocator) {
         DynamicType.Builder<?> transformed = builder;
         if (shouldApplyMethodAdvice(typeDescription)) {
-            transformed = transformed.visit(new AotMethodLoggingTransformer(
-                    classNameFormat, printExceptionStackTrace, enterLogLevel, exitLogLevel, exceptionLogLevel));
+            transformed =
+                    transformed.visit(new AotMethodLoggingTransformer(classNameFormat, enterLogLevel, exitLogLevel));
         }
         if (shouldRewriteToString(typeDescription)) {
             TypePool sharedTypePool = compileContext.sharedTypePool(classFileLocator);

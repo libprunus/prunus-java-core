@@ -1,28 +1,25 @@
 package org.libprunus.core.config;
 
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicReference;
 import org.libprunus.core.log.runtime.AotLogRuntime;
 
 public final class ConfigurationRepository {
 
-    private volatile CoreRuntimeConfig currentSnapshot;
+    private final AtomicReference<CoreRuntimeConfig> currentSnapshot;
 
     public ConfigurationRepository(CoreRuntimeConfig initialConfig) {
-        this.currentSnapshot = Objects.requireNonNull(initialConfig, "initialConfig must not be null");
-        syncToDataPlane(this.currentSnapshot);
+        this.currentSnapshot =
+                new AtomicReference<>(Objects.requireNonNull(initialConfig, "initialConfig must not be null"));
+        AotLogRuntime.linkToDataPlane(this.currentSnapshot);
     }
 
     public CoreRuntimeConfig getGlobalSnapshot() {
-        return currentSnapshot;
+        return currentSnapshot.get();
     }
 
-    public synchronized void refresh(CoreRuntimeConfig newConfig) {
+    public void refresh(CoreRuntimeConfig newConfig) {
         CoreRuntimeConfig config = Objects.requireNonNull(newConfig, "newConfig must not be null");
-        currentSnapshot = config;
-        syncToDataPlane(config);
-    }
-
-    private void syncToDataPlane(CoreRuntimeConfig config) {
-        AotLogRuntime.updateConfig(config.log());
+        currentSnapshot.set(config);
     }
 }

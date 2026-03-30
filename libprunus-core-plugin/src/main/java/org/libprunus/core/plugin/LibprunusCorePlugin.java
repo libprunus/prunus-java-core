@@ -9,6 +9,8 @@ import org.gradle.api.artifacts.VersionCatalogsExtension;
 import org.gradle.api.file.RegularFile;
 import org.gradle.api.plugins.ExtensionContainer;
 import org.gradle.api.provider.Provider;
+import org.gradle.api.tasks.SourceSet;
+import org.gradle.api.tasks.SourceSetContainer;
 import org.gradle.api.tasks.TaskProvider;
 import org.libprunus.core.plugin.aot.AotByteBuddyDispatcher;
 import org.libprunus.core.plugin.aot.AotExtension;
@@ -40,6 +42,8 @@ public final class LibprunusCorePlugin implements Plugin<Project> {
     private void configureByteBuddy(Project project, AotExtension aot) {
         Provider<RegularFile> configFileProvider =
                 project.getLayout().getBuildDirectory().file("tmp/libprunus/aot/aot-config.properties");
+        SourceSetContainer sourceSets = project.getExtensions().getByType(SourceSetContainer.class);
+        SourceSet mainSourceSet = sourceSets.getByName(SourceSet.MAIN_SOURCE_SET_NAME);
         TaskProvider<GenerateAotConfigTask> generateAotConfig = project.getTasks()
                 .register("generateAotConfig", GenerateAotConfigTask.class, task -> {
                     AotLogExtension aotLog = aot.getLog();
@@ -50,15 +54,20 @@ public final class LibprunusCorePlugin implements Plugin<Project> {
                     task.getTargetClassSuffixes().set(aotLog.getTargetClassSuffixes());
                     task.getPojoSuffixes().set(aotLog.getPojoSuffixes());
                     task.getClassNameFormat().set(aotLog.getClassNameFormat().map(value -> value.name()));
-                    task.getPrintExceptionStackTrace().set(aotLog.getPrintExceptionStackTrace());
                     task.getEnterLogLevel().set(aotLog.getEnterLogLevel().map(value -> value.name()));
                     task.getExitLogLevel().set(aotLog.getExitLogLevel().map(value -> value.name()));
-                    task.getExceptionLogLevel()
-                            .set(aotLog.getExceptionLogLevel().map(value -> value.name()));
                     task.getHandleInaccessibleField().set(aotLog.getHandleInaccessibleField());
                     task.getMaxToStringDepth().set(aotLog.getMaxToStringDepth());
+                    task.getToStringWhitelist().set(aotLog.getToStringWhitelist());
+                    task.getGeneratedSourceDir()
+                            .set(project.getLayout().getBuildDirectory().dir("generated/sources/aot/java/main"));
                     task.getOutputFile().set(configFileProvider);
                 });
+
+        mainSourceSet.getJava().srcDir(generateAotConfig.flatMap(GenerateAotConfigTask::getGeneratedSourceDir));
+        project.getTasks()
+                .named(mainSourceSet.getCompileJavaTaskName())
+                .configure(task -> task.dependsOn(generateAotConfig));
 
         project.getPluginManager().apply("net.bytebuddy.byte-buddy-gradle-plugin");
         project.getExtensions().configure(ByteBuddyTaskExtension.class, byteBuddy -> {

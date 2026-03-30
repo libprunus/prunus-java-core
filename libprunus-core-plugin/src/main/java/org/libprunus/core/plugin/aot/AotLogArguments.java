@@ -9,12 +9,11 @@ public record AotLogArguments(
         List<String> targetClassSuffixes,
         List<String> pojoSuffixes,
         String classNameFormat,
-        boolean printExceptionStackTrace,
         String enterLogLevel,
         String exitLogLevel,
-        String exceptionLogLevel,
         boolean handleInaccessibleField,
-        int maxToStringDepth)
+        int maxToStringDepth,
+        List<String> toStringWhitelist)
         implements Serializable {
 
     @Serial
@@ -23,5 +22,6 @@ public record AotLogArguments(
     public AotLogArguments {
         targetClassSuffixes = List.copyOf(targetClassSuffixes);
         pojoSuffixes = List.copyOf(pojoSuffixes);
+        toStringWhitelist = List.copyOf(toStringWhitelist);
     }
 }

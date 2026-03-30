@@ -58,6 +58,9 @@ public final class AotByteBuddyDispatcher implements Plugin {
                 try {
                     registeredPlugin.plugin().close();
                 } catch (Throwable exception) {
+                    if (exception instanceof Error error) {
+                        throw error;
+                    }
                     if (aggregated == null) {
                         aggregated = exception instanceof IOException ioEx
                                 ? ioEx
